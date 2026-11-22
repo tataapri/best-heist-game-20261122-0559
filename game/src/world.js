@@ -1,124 +1,134 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// The room itself: building a level's live state from its layout, moving a
+// circle through solid rectangles, and testing whether a straight line of
+// sight is blocked by a wall or a display case.
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+import {
+  CAMERA_CONE_RANGE,
+  GUARD_CONE_RANGE,
+  LEVELS,
+  LOOT_VALUES,
+  WORLD_HEIGHT,
+  WORLD_WIDTH,
+} from './config.js';
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+export function buildLevelState(levelIndex, random) {
+  const layout = LEVELS[levelIndex];
+  const solids = [...layout.walls, ...layout.cases];
+  return {
+    levelIndex,
+    layout,
+    solids,
+    loot: layout.loot.map((piece) => ({ ...piece, taken: false, value: LOOT_VALUES[piece.kind] })),
+    guards: layout.guards.map((guard, i) => ({
+      id: i,
+      x: guard.waypoints[0][0],
+      y: guard.waypoints[0][1],
+      waypoints: guard.waypoints,
+      waypointIndex: 1,
+      angle: 0,
+      mode: 'patrol', // patrol | investigate | chase
+      investigateX: 0,
+      investigateY: 0,
+      investigateTimer: 0,
+      pauseTimer: 0,
+      phase: random() * Math.PI * 2,
+    })),
+    cameras: layout.cameras.map((camera) => ({
+      ...camera,
+      angle: camera.baseAngle,
+      time: random() * 10,
+    })),
+    thief: {
+      x: layout.thiefStart.x,
+      y: layout.thiefStart.y,
+      angle: -Math.PI / 2,
+      sneaking: false,
+      moving: false,
+    },
+    exit: { ...layout.exit },
+    coins: [],
+    coinsLeft: 3,
+    alarm: 0,
+    seenNow: false,
+    lootCollected: 0,
+    lootValue: 0,
+    timeInLevel: 0,
+  };
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
-
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
-  }
-
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
-  }
-
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
-  }
-
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
-      }
-    }
-    return events;
-  }
-
-  reset();
-  return { state, reset, step };
+export function allLootTaken(level) {
+  return level.loot.every((piece) => piece.taken);
 }
+
+export function circleHitsSolid(x, y, radius, solids) {
+  for (const rect of solids) {
+    const nearestX = Math.max(rect.x, Math.min(x, rect.x + rect.w));
+    const nearestY = Math.max(rect.y, Math.min(y, rect.y + rect.h));
+    const dx = x - nearestX;
+    const dy = y - nearestY;
+    if (dx * dx + dy * dy < radius * radius) return true;
+  }
+  return false;
+}
+
+// Slide a circle along the walls: try the full step, then each axis alone.
+export function moveCircle(body, dx, dy, radius, solids) {
+  const nextX = Math.max(radius, Math.min(WORLD_WIDTH - radius, body.x + dx));
+  const nextY = Math.max(radius, Math.min(WORLD_HEIGHT - radius, body.y + dy));
+  if (!circleHitsSolid(nextX, nextY, radius, solids)) {
+    body.x = nextX;
+    body.y = nextY;
+    return;
+  }
+  if (!circleHitsSolid(nextX, body.y, radius, solids)) body.x = nextX;
+  if (!circleHitsSolid(body.x, nextY, radius, solids)) body.y = nextY;
+}
+
+function segmentHitsRect(x1, y1, x2, y2, rect) {
+  // Slab test: does the segment cross the rectangle's interior?
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let tMin = 0;
+  let tMax = 1;
+  for (const [origin, delta, low, high] of [
+    [x1, dx, rect.x, rect.x + rect.w],
+    [y1, dy, rect.y, rect.y + rect.h],
+  ]) {
+    if (Math.abs(delta) < 1e-9) {
+      if (origin < low || origin > high) return false;
+    } else {
+      let t1 = (low - origin) / delta;
+      let t2 = (high - origin) / delta;
+      if (t1 > t2) [t1, t2] = [t2, t1];
+      tMin = Math.max(tMin, t1);
+      tMax = Math.min(tMax, t2);
+      if (tMin > tMax) return false;
+    }
+  }
+  return true;
+}
+
+export function lineOfSightBlocked(x1, y1, x2, y2, solids) {
+  for (const rect of solids) {
+    if (segmentHitsRect(x1, y1, x2, y2, rect)) return true;
+  }
+  return false;
+}
+
+// Is the thief inside a watcher's cone (range, angle, clear sight line)?
+export function thiefInsideCone(watcherX, watcherY, watcherAngle, halfAngle, range, thief, solids) {
+  const dx = thief.x - watcherX;
+  const dy = thief.y - watcherY;
+  const distance = Math.hypot(dx, dy);
+  if (distance > range) return { seen: false, closeness: 0 };
+  let angleDiff = Math.atan2(dy, dx) - watcherAngle;
+  while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+  while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+  if (Math.abs(angleDiff) > halfAngle) return { seen: false, closeness: 0 };
+  if (lineOfSightBlocked(watcherX, watcherY, thief.x, thief.y, solids)) {
+    return { seen: false, closeness: 0 };
+  }
+  return { seen: true, closeness: 1 - distance / range };
+}
+
+export { GUARD_CONE_RANGE, CAMERA_CONE_RANGE };
